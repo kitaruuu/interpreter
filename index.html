@@ -74,7 +74,7 @@ body{
 /* 3言語は同じ大きさ・固定順（繁中 / EN / 日本語）。どれを読むかは選ばせない。
    判別した言語の行だけ「原文」と付けて少し落とす（話者は自分の言葉を読み返さない） */
 .tx{
-  flex:1 1 auto; font-size:25px; line-height:1.35; color:var(--fg); font-weight:600;
+  flex:1 1 auto; font-size:20px; line-height:1.4; color:var(--fg); font-weight:600;
   white-space:pre-wrap; word-break:break-word; min-height:1em;
 }
 .l.src .tx{color:#9fb0bd; font-weight:500}
@@ -957,7 +957,8 @@ async function micOn(){
   const token=++micGeneration;
   try{
     const stream = await navigator.mediaDevices.getUserMedia({
-      audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:false}});
+      // 囁き・遠い声を拾うため自動ゲインは入れる。ノイズ抑制は息の成分を削るので切る
+      audio:{echoCancellation:false, noiseSuppression:false, autoGainControl:true}});
     if(token!==micGeneration || !running){stream.getTracks().forEach(t=>t.stop()); return false;}
     micStream=stream;
     micCtx=new (window.AudioContext||window.webkitAudioContext)({sampleRate:16000});
@@ -1125,7 +1126,7 @@ class LiveTranscriber {
       const timeout=setTimeout(()=>reject(new Error('接続タイムアウト')),8000);
       this.cancelOpen=()=>{clearTimeout(timeout);reject(new Error('停止済み'));};
       ws.onopen=()=>ws.send(JSON.stringify({setup:{model:'models/gemini-3.5-transcribe-live',
-        generationConfig:{responseModalities:['TEXT']},inputAudioTranscription:{languageCodes:[]}}}));
+        generationConfig:{responseModalities:['TEXT']},inputAudioTranscription:{languageCodes:['ja-JP','en-US','zh-TW']}}}));   // 候補を3言語に絞る。無制限だと聞き取りにくい声がヒンディー等になる（2026-09-27 実機）
       ws.onmessage=async event=>{
         try{
           const raw=typeof event.data==='string'?event.data:await event.data.text();
@@ -1145,12 +1146,18 @@ class LiveTranscriber {
     // AudioWorklet avoids main-thread scheduling pauses. Downsample to 16 kHz in 50 ms chunks
     // (100ms だと送る前に最大 100ms 溜め込む。半分にして認識の頭出しを早める).
     const worklet=`class PCM extends AudioWorkletProcessor{
-      constructor(){super();this.buffer=new Int16Array(800);this.n=0;this.sum=0;this.count=0;this.phase=0;}
+      constructor(){super();this.f=new Float32Array(800);this.n=0;this.sum=0;this.count=0;this.phase=0;this.gain=1;}
       process(inputs){const input=inputs[0]?.[0];if(!input)return true;
         for(const value of input){this.sum+=value;this.count++;this.phase+=16000;
-          if(this.phase>=sampleRate){this.phase-=sampleRate;const v=Math.max(-1,Math.min(1,this.sum/this.count));
-            this.buffer[this.n++]=v<0?v*32768:v*32767;this.sum=0;this.count=0;
-            if(this.n===800){this.port.postMessage(this.buffer.buffer,[this.buffer.buffer]);this.buffer=new Int16Array(800);this.n=0;}}
+          if(this.phase>=sampleRate){this.phase-=sampleRate;this.f[this.n++]=Math.max(-1,Math.min(1,this.sum/this.count));this.sum=0;this.count=0;
+            if(this.n===800){
+              let peak=0;for(let k=0;k<800;k++){const a=Math.abs(this.f[k]);if(a>peak)peak=a;}
+              // 囁き対策の簡易AGC: 小さい声は最大8倍まで持ち上げる。無音（ノイズ床）は持ち上げない
+              const want=peak<0.004?1:Math.min(8,Math.max(1,0.5/peak));
+              this.gain=this.gain*0.7+want*0.3;
+              const out=new Int16Array(800);
+              for(let k=0;k<800;k++){const v=Math.max(-1,Math.min(1,this.f[k]*this.gain));out[k]=v<0?v*32768:v*32767;}
+              this.port.postMessage(out.buffer,[out.buffer]);this.n=0;}}
         }return true;
       }}registerProcessor('rti-pcm',PCM);`;
     const url=URL.createObjectURL(new Blob([worklet],{type:'text/javascript'}));
@@ -1180,6 +1187,8 @@ function transcriptLang(code,text){
 function receiveLiveTranscript(item,final){
   if(!running || speechMode!=='live')return;
   const text=item.text.trim();if(!text)return;liveRecoveries=0;
+  // 日中英のどの文字も含まない断片（別言語として誤認識された雑音）は捨てる
+  if(!/[ぁ-ゖァ-ヺ一-鿿A-Za-z0-9]/.test(text)) return;
   const lang=transcriptLang(item.languageCode||'',text);
   if(lang!==curLang){
     if(draftController)draftController.abort();pending=null;cache.clear();lastText='';
