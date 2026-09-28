@@ -1839,6 +1839,9 @@ document.addEventListener('keydown', e=>{
 
 /* ===================== boot ===================== */
 if(new URLSearchParams(location.search).has('debug')) document.body.classList.add('debug');
+// ?asr=browser で内蔵の音声認識（Chrome / iPhone）に、?asr=live で Gemini のライブ文字起こしに切り替える（この読み込みだけ。保存しない）。
+// 2026-09-28 実測: 発話→原文 980ms のうち大半がライブ文字起こしの遅れ。内蔵認識と同じ端末で比べるための入口
+{ const a=new URLSearchParams(location.search).get('asr'); if(a==='browser'||a==='live') S.engine = a==='browser'?'browser':'auto'; }
 paint(); newLive();
 if(!window.isSecureContext){
   // http://<PCのIP>:8787 をスマホで開くとここに来る。マイク API 自体が無効になる
