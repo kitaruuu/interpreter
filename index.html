@@ -833,10 +833,11 @@ function timingLabel(blk){
   }
   return p.join(' · ');
 }
+function median(arr){ const a=[...arr].sort((x,y)=>x-y); return a[Math.floor(a.length/2)]; }
 function paintE2E(){
   if(e2eLog.length<3){ $('e2e').textContent=''; return; }
-  const a=[...e2eLog].sort((x,y)=>x-y), m=a[Math.floor(a.length/2)];
-  $('e2e').textContent='発話→訳 中央値 '+m+'ms ('+a.length+')';
+  // 内訳を並べる。どちらが重いかで次の手（翻訳側か音声認識側か）が決まる
+  $('e2e').textContent='発話→原文 '+median(asrLog)+' · 原文→訳 '+median(mtLog)+' · 発話→訳 '+median(e2eLog)+'ms ('+e2eLog.length+')';
 }
 function trackPerformance(blk,started,reused){
   const now=performance.now(), request=blk.preview;
@@ -845,7 +846,11 @@ function trackPerformance(blk,started,reused){
   perfLog.push(row); if(perfLog.length>200) perfLog.shift();
   const tl=timingLabel(blk);
   blk.meta.textContent=(reused?'先行訳を再利用 · ':'')+'確定後 '+row.finalWaitMs+'ms'+(tl?' · '+tl:'');
-  if(blk.onsetAt && blk.firstTransAt){ e2eLog.push(blk.firstTransAt-blk.onsetAt); if(e2eLog.length>50) e2eLog.shift(); paintE2E(); }
+  if(blk.onsetAt && blk.firstTransAt){
+    e2eLog.push(blk.firstTransAt-blk.onsetAt); asrLog.push(blk.firstTextAt-blk.onsetAt); mtLog.push(Math.max(0,blk.firstTransAt-blk.firstTextAt));
+    for(const l of [e2eLog,asrLog,mtLog]) if(l.length>50) l.shift();
+    paintE2E();
+  }
 }
 function paintQueue(){}                                    // 待ち件数は出さない（右下は状態と1つの数字だけ）
 
@@ -1385,7 +1390,7 @@ function finish(src, out, ms){
    話者自身が置いた無音を区切りにすると、その両方を避けられる。 */
 let micStream=null, micCtx=null, micRaf=0;
 let voiceOnset=0;                    // 直近の「無音→有声」の時刻。発話開始の代理
-const e2eLog=[];                     // 声の立ち上がり→訳の最初の文字（ms）
+const e2eLog=[], asrLog=[], mtLog=[];   // 声の立ち上がり→訳 / 声→原文 / 原文→訳（ms）
 const micEl=$('mic'), micBar=micEl.firstElementChild;
 const VOICE_TH = 7;            // これ以上を有声とみなす（レベルメーターの hot と同じ基準）
 
