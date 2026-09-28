@@ -114,7 +114,6 @@ button:focus-visible,a:focus-visible,input:focus-visible{outline:2px solid var(-
     flex-wrap:wrap; font-size:10px; padding:6px 10px calc(6px + env(safe-area-inset-bottom))}
   #err{bottom:calc(54px + env(safe-area-inset-bottom)); max-width:92vw; font-size:12px}
   #panel{align-items:stretch; justify-content:stretch}
-  .row textarea{font-size:16px}   /* iOS は 16px 未満だと入力時に拡大される */
   #card{width:100%; height:100%; max-height:none; border-radius:0; border:none;
     padding:22px 16px calc(22px + env(safe-area-inset-bottom))}
   .pc{display:none}
@@ -155,7 +154,7 @@ kbd{background:var(--bg2);border:1px solid var(--line);border-radius:5px;padding
 #card h2{font-size:17px;margin-bottom:20px;font-weight:700}
 .row{margin-bottom:17px}
 .row label{display:block; font-size:12px; color:var(--dim); margin-bottom:6px}
-.row input[type=password],.row textarea{width:100%; padding:9px 11px; background:var(--bg);
+.row input[type=password]{width:100%; padding:9px 11px; background:var(--bg);
   border:1px solid var(--line); border-radius:8px; color:var(--fg); font-size:14px; font-family:inherit}
 .row input[type=range]{width:100%; accent-color:var(--accent)}
 .chk{display:flex; align-items:center; gap:9px; font-size:14px; color:var(--fg); cursor:pointer}
@@ -218,13 +217,6 @@ hr{border:none;border-top:1px solid var(--line);margin:20px 0}
     </div>
 
     <div class="row">
-      <label for="gloss">用語集（この端末だけの追加分。1行1語、<b>日本語 = English = 繁中</b>）</label>
-      <textarea id="gloss" rows="3" placeholder="定期 = ARS = 定期購買&#10;青汁 = Aojiru = 青汁&#10;SKU"></textarea>
-      <div class="hint">全端末共通の用語は index.html に焼き込んであります（Claude に一覧を渡すと更新）。
-        翻訳専用 API では用語部分を「翻訳禁止」で素通しさせるので<b>速度は落ちません</b>。1語だけ書くとその語を3言語共通で固定します。</div>
-    </div>
-
-    <div class="row">
       <button id="diag" class="pill" style="width:100%;padding:10px;font-size:14px">
         接続テスト（マイクと API を1回だけ確認）
       </button>
@@ -259,7 +251,7 @@ const MODEL = 'gemini-3.5-flash-lite';
 // last = 前回実際に話されていた言語。次の起動をそこから始める
 // engine は画面に出さない。既定 auto（多言語認識、接続不可時は Chrome へ退避）。
 // localStorage の engine:'browser' は tests/regression.cjs が Chrome 経路を強制するための入口
-const DEF = { key:'', tkey:'', last:'ja', engine:'auto', gloss:'' };
+const DEF = { key:'', tkey:'', last:'ja', engine:'auto' };
 let S = {...DEF};
 try {
   const saved = JSON.parse(localStorage.getItem('rti2') || '{}');
@@ -268,7 +260,6 @@ try {
     if(['auto','browser'].includes(saved.engine)) S.engine=saved.engine;
     if(typeof saved.key==='string') S.key=saved.key.trim();
     if(typeof saved.tkey==='string') S.tkey=saved.tkey.trim();
-    if(typeof saved.gloss==='string') S.gloss=saved.gloss.slice(0,20000);
   }
 } catch(_) {}
 /* URL の #k=<Geminiキー>&t=<Translationキー> からキーを取り込む。
@@ -305,7 +296,7 @@ const cache=new Map();                         // 途中翻訳の再利用（確
 
 /* ===================== ui ===================== */
 function paint(){
-  $('key').value=S.key; $('tkey').value=S.tkey; $('gloss').value=S.gloss;
+  $('key').value=S.key; $('tkey').value=S.tkey;
   $('bm').textContent = S.key ? bookmarkUrl() : '';
 }
 /* 失敗を 6 秒のトーストだけにすると、見逃した瞬間に
@@ -350,7 +341,7 @@ function newLive(){ live = makeBlock(); }
 
 /* ===================== 用語集 =====================
    会議で最初に壊れるのは社名・商品名・略語。ここだけは推測させない。
-   GLOSSARY_BUILTIN は全端末共通（index.html に焼き込み）。S.gloss はその端末だけの追加分。
+   GLOSSARY_BUILTIN は全端末共通（glossary.txt → tools/inject_glossary.py で index.html に焼き込み）。端末別の追加は持たない。
    形式: 1行1語「日本語 = English = 繁中」。1語だけの行はその語を3言語共通で固定。# で始まる行は無視 */
 const GLOSSARY_BUILTIN = `
 サントリー = Suntory = 三得利
@@ -725,7 +716,7 @@ Meta
 let glossCache=null;
 function glossary(){
   if(glossCache) return glossCache;
-  const lines=(GLOSSARY_BUILTIN+'\n'+(S.gloss||'')).split('\n').map(l=>l.trim()).filter(l=>l && !l.startsWith('#'));
+  const lines=GLOSSARY_BUILTIN.split('\n').map(l=>l.trim()).filter(l=>l && !l.startsWith('#'));
   const out=[];
   for(const l of lines){
     const p=l.split('=').map(x=>x.trim());
@@ -1813,7 +1804,6 @@ $('close').onclick=()=>$('panel').classList.remove('open');
 $('panel').onclick=e=>{ if(e.target===$('panel')) $('panel').classList.remove('open'); };
 $('key').oninput=e=>{ S.key=e.target.value.trim(); save(); };
 $('tkey').oninput=e=>{ S.tkey=e.target.value.trim(); fastState='unknown'; save(); paint(); };
-$('gloss').oninput=e=>{ S.gloss=e.target.value; glossCache=null; cache.clear(); save(); };
 
 document.addEventListener('keydown', e=>{
   if($('panel').classList.contains('open')){ if(e.key==='Escape') $('panel').classList.remove('open'); return; }
