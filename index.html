@@ -78,7 +78,7 @@ body{
 /* 3言語は同じ大きさ・固定順（繁中 / EN / 日本語）。どれを読むかは選ばせない。
    判別した言語の行だけ「原文」と付けて少し落とす（話者は自分の言葉を読み返さない） */
 .tx{
-  flex:1 1 auto; font-size:18px; line-height:1.4; color:var(--fg); font-weight:600;
+  flex:1 1 auto; font-size:16px; line-height:1.4; color:var(--fg); font-weight:600;
   white-space:pre-wrap; word-break:break-word; min-height:1em;
 }
 .l.src .tx{color:#9fb0bd; font-weight:500}
@@ -1434,17 +1434,22 @@ async function micOn(){
   const buf = new Uint8Array(an.fftSize);
   let quiet=0, warned=false;
   let voiced=false, silFrom=0;
+  // ノイズ床を追従する。自動ゲインを入れてから環境音だけで「有声」になり、発話開始の時刻が早く記録される
+  // （発話→原文が実態より大きく出る）ことがあるため、閾値は「床＋6」と固定値の大きい方にする
+  let floor=0, th=VOICE_TH;
   (function tick(){
     an.getByteTimeDomainData(buf);
     let peak=0;
     for(let i=0;i<buf.length;i++){ const v=Math.abs(buf[i]-128); if(v>peak) peak=v; }
     const pct = Math.min(100, Math.round(peak/60*100));
     micBar.style.width = pct+'%';
-    micEl.classList.toggle('hot', pct>VOICE_TH);
+    if(pct<floor) floor=pct; else floor=Math.min(floor+0.02, pct);   // 下がるのは即座、上がるのはゆっくり
+    th=Math.max(VOICE_TH, floor+6);
+    micEl.classList.toggle('hot', pct>th);
 
     // 有声 → 無音が SIL_MS ミリ秒続いたら、そこを意味の区切りとみなす
     const now=Date.now();
-    if(pct>VOICE_TH){ if(!voiced) voiceOnset=now; voiced=true; silFrom=0; }
+    if(pct>th){ if(!voiced) voiceOnset=now; voiced=true; silFrom=0; }
     else if(voiced){
       if(!silFrom) silFrom=now;
       else if(now-silFrom > SIL_MS){ voiced=false; silFrom=0; flushSegment(); }
