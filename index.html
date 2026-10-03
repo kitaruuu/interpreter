@@ -243,6 +243,25 @@ hr{border:none;border-top:1px solid var(--line);margin:20px 0}
 <script>
 'use strict';
 
+/* ===================== 背面でも止まらないタイマー =====================
+   別のアプリを前面にすると Chrome はこのタブを「非表示」とみなし、requestAnimationFrame は止まり、
+   setTimeout は1秒刻みに丸められる。デスクトップ字幕で使うときはそれが常態なので、Worker のタイマーに逃がす */
+const BG=(()=>{
+  let w=null, seq=0, tick=null; const cbs=new Map();
+  try{
+    const src='let iv=null;onmessage=e=>{const d=e.data;if(d.t==="to")setTimeout(()=>postMessage({id:d.id}),d.ms);'+
+      'else if(d.t==="on"){if(!iv)iv=setInterval(()=>postMessage({tick:1}),16);}else if(d.t==="off"){clearInterval(iv);iv=null;}}';
+    w=new Worker(URL.createObjectURL(new Blob([src],{type:'text/javascript'})));
+    w.onmessage=e=>{ const d=e.data; if(d.tick){ if(tick) tick(); return; } const f=cbs.get(d.id); if(f){ cbs.delete(d.id); f(); } };
+  }catch(_){ w=null; }
+  return {
+    setTimeout(fn,ms){ if(!w) return setTimeout(fn,ms); const id=++seq; cbs.set(id,fn); w.postMessage({t:'to',id,ms:ms||0}); return -id; },
+    clearTimeout(h){ if(typeof h==='number' && h<0) cbs.delete(-h); else clearTimeout(h); },
+    startTick(fn){ tick=fn; if(w) w.postMessage({t:'on'}); else { const loop=()=>{ if(tick!==fn) return; fn(); requestAnimationFrame(loop); }; requestAnimationFrame(loop); } },
+    stopTick(){ tick=null; if(w) w.postMessage({t:'off'}); }
+  };
+})();
+
 /* ===================== config ===================== */
 const L = {
   zh:{rec:'zh-TW', tag:'繁中',  name:'Traditional Chinese (Taiwan)'},
@@ -809,7 +828,7 @@ const endpoint = () =>
 let lastTouch=0;
 let generation=0, micGeneration=0, restartTimer=null;
 let draftController=null, commitChain=Promise.resolve(), finalQueued=0;
-const sleep=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+const sleep=ms=>new Promise(resolve=>BG.setTimeout(resolve,ms));
 const canonical=(text,lang)=>lang==='en'?text.trim().replace(/\s+/g,' '):text.replace(/\s+/g,'');
 const cacheKey=(text,lang)=>lang+'\n'+canonical(text,lang);
 const perfLog=[];
@@ -1142,7 +1161,7 @@ function pump(){
   // 最速経路は 1 往復が安く速いので、上限も床も置かない。Gemini は 1 ブロック 6 回・200ms 床
   if(minGap>0 || (live.draftCount||0)>=(fast?60:6)){pending=null;return;}
   const wait=Math.max(0,Math.max(minGap,fast?0:200)-(Date.now()-lastSend));
-  if(wait>0){ clearTimeout(gapTimer); gapTimer=setTimeout(pump, wait); return; }
+  if(wait>0){ BG.clearTimeout(gapTimer); gapTimer=BG.setTimeout(pump, wait); return; }
   const t=pending; pending=null;
   if(t===lastText) return;                       // 原文が伸びていない。投げる意味がない
   // 1～2文字伸びただけで投げ直しても訳はほぼ変わらない。上限を無駄に使うだけなので、
@@ -1308,7 +1327,7 @@ function commit(srcText){
   const loose=x=>canonical(x,lang).replace(/[。、．，！？!?,.\s]+$/,'');
   const adopt=preview && !preview.opts.controller?.signal.aborted &&
     (preview.key===cacheKey(t,lang) || (preview.text!=null && loose(preview.text)===loose(t)));
-  pending=null; lastText=''; clearTimeout(gapTimer); seq++;
+  pending=null; lastText=''; BG.clearTimeout(gapTimer); seq++;
   if(adopt){
     preview.opts.keep=true; (preview.optsList||[]).forEach(o=>o.keep=true);
     if(draftController===preview.opts.controller) draftController=null;
@@ -1437,7 +1456,7 @@ async function micOn(){
   // ノイズ床を追従する。自動ゲインを入れてから環境音だけで「有声」になり、発話開始の時刻が早く記録される
   // （発話→原文が実態より大きく出る）ことがあるため、閾値は「床＋6」と固定値の大きい方にする
   let floor=0, th=VOICE_TH;
-  (function tick(){
+  BG.startTick(function tick(){
     an.getByteTimeDomainData(buf);
     let peak=0;
     for(let i=0;i<buf.length;i++){ const v=Math.abs(buf[i]-128); if(v>peak) peak=v; }
@@ -1462,13 +1481,12 @@ async function micOn(){
         showErr('マイクから音が入っていません。Windows のサウンド設定で「既定の録音デバイス」を確認してください。');
       }
     }else{ quiet=0; warned=false; micEl.classList.remove('dead'); }
-    micRaf = requestAnimationFrame(tick);
-  })();
+  });
   return true;
 }
 function micOff(){
   micGeneration++;
-  if(micRaf){ cancelAnimationFrame(micRaf); micRaf=0; }
+  BG.stopTick();
   if(micStream){ micStream.getTracks().forEach(t=>t.stop()); micStream=null; }
   if(micCtx){ micCtx.close().catch(()=>{}); micCtx=null; }
   micBar.style.width='0%'; micEl.classList.remove('hot','dead');
@@ -1731,7 +1749,7 @@ function stop(){
   }
   running=false; document.body.classList.remove('recording'); generation++; seq++; pending=null;
   wakeOff();
-  clearTimeout(gapTimer); clearTimeout(restartTimer);
+  BG.clearTimeout(gapTimer); clearTimeout(restartTimer);
   if(draftController) draftController.abort();
   detConfirmed=false; detLast=null; detStreak=0;
   resetSeg(); liveSpeech?.close();liveSpeech=null;micOff();
@@ -1841,6 +1859,32 @@ document.addEventListener('keydown', e=>{
   if(e.code==='Space'){ e.preventDefault(); running?stop():start(); }
   else if(e.key==='Escape'){ stop(); }
 });
+
+/* ===================== デスクトップ字幕 =====================
+   PC のランチャー（run.cmd）経由で、字幕ウィンドウが出ているときだけ、表示中の3言語を送る。
+   タイマーは使わない（背面で1秒刻みになる）。DOM の変化を MutationObserver で拾ってその場で送る */
+let overlayOn=false, ovLast='';
+function pushOverlay(){
+  if(!overlayOn) return;
+  const liveEl=document.querySelector('#stage .u.live.has-text');
+  const done=document.querySelectorAll('#stage .u:not(.live)');
+  const el=liveEl || done[done.length-1];
+  if(!el) return;
+  const srcRow=el.querySelector('.l.src');
+  const p={live:!!liveEl, src:srcRow?srcRow.dataset.l:''};
+  for(const k of ORDER){ const t=el.querySelector('.l[data-l="'+k+'"] .tx'); p[k]=t?t.textContent:''; }
+  const body=JSON.stringify(p);
+  if(body===ovLast) return;
+  ovLast=body;
+  fetch('/overlay',{method:'POST',headers:{'Content-Type':'application/json'},body,keepalive:true}).catch(()=>{});
+}
+if(/^(127\.0\.0\.1|localhost)$/.test(location.hostname)){
+  fetch('/overlay').then(r=>r.ok?r.json():null).then(j=>{
+    if(!j || !j.overlay) return;
+    overlayOn=true;
+    new MutationObserver(pushOverlay).observe(stage,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['class']});
+  }).catch(()=>{});
+}
 
 /* ===================== boot ===================== */
 if(new URLSearchParams(location.search).has('debug')) document.body.classList.add('debug');
