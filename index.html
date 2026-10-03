@@ -314,6 +314,14 @@ let live=null, ctxPairs=[];
 let seq=0, inflight=0, pending=null, lastSwitch=0, t0=0;
 let minGap=0, lastSend=0, gapTimer=null;       // 429 に応じて自動で広がる送信間隔
 let last429=0, toast429=0;
+/* 節約モード。429 を受けたら 30 分間、先行訳（喋っている途中の訳）を止めて確定訳だけにする。
+   無料枠は「1分あたり」と「1日あたり」の両方に上限があり、先行訳は1発話で最大 12 リクエスト使う。
+   確定訳だけなら1発話1リクエスト以下（まとめて送る）なので、1分あたりの上限に収まる。
+   再読み込みしても続くように時刻を保存する（開き直すたびに上限を使い切らないため） */
+let ecoUntil=0; try{ ecoUntil=Number(localStorage.getItem('rti2_eco')||0)||0; }catch(_){}
+const eco=()=>Date.now()<ecoUntil;
+function ecoOn(){ ecoUntil=Date.now()+30*60*1000; try{ localStorage.setItem('rti2_eco',String(ecoUntil)); }catch(_){} }
+let dayLimited=false;                 // 1日の上限に達した。待っても通らないので再送しない
 const sendLog=[];                              // req/min 計測
 const cache=new Map();                         // 途中翻訳の再利用（確定を0msにする）
 
@@ -326,7 +334,7 @@ function paint(){
    「原文だけ並んで翻訳が出ない」が原因不明になる。直るまで出し続ける */
 function apiOk(){ $('api').textContent=''; }
 function apiBad(m){ $('api').textContent='\u26a0 '+m; }
-function paintGap(){ $('gap').textContent = minGap ? 'gap '+minGap+'ms' : ''; }
+function paintGap(){ $('gap').textContent = dayLimited ? '1日の上限に到達' : eco() ? '節約モード（確定訳のみ）' : minGap ? 'gap '+minGap+'ms' : ''; }
 
 function showErr(m){
   errBox.textContent=m; errBox.style.display='block';
@@ -1102,7 +1110,15 @@ async function send(text, opts={}){
       const retry=Number(res.headers.get('retry-after'));
       // 上限は 15 秒。60 秒まで広げると、1回の 429 で1分近く訳が出なくなる
       minGap=Math.min(15000,Math.max(1000,minGap*2,Number.isFinite(retry)?retry*1000:0));
-      paintGap(); throw new Error('429 レート上限：送信間隔 '+minGap+'ms');
+      // 当たったのが「1分あたり」か「1日あたり」かを見分ける。応答本文は表示せず、種類の判定にだけ使う
+      let kind='';
+      try{ const t=JSON.stringify(await res.json()); kind=/PerDay/i.test(t)?'day':/PerMinute/i.test(t)?'minute':''; }catch(_){}
+      ecoOn();
+      if(kind==='day'){ dayLimited=true; retryable=false; }
+      paintGap();
+      throw new Error(kind==='day' ? '429 無料枠の1日の上限に達しました。今日は翻訳が通りません（課金を有効にしたキーが必要）'
+                    : kind==='minute' ? '429 1分あたりの上限。節約モードに切替（確定訳のみ）'
+                    : '429 レート上限。節約モードに切替（確定訳のみ）');
     }
     if(!res.ok){
       retryable=res.status>=500;
@@ -1171,6 +1187,8 @@ function pump(){
   // レート上限に当たっている間は、途中翻訳を捨てて確定ぶんに予算を回す。
   // 途中翻訳は捨てても確定時に出るが、確定を落とすとその発話の訳は二度と出ない
   const fast=fastOn();
+  // 節約モード中は先行訳を出さない（Cloud Translation 経路は回数の上限が別なので対象外）
+  if(!fast && eco()){ pending=null; DIAG.draftsDropped++; return; }
   // 最速経路は 1 往復が安く速いので、上限も床も置かない。Gemini は 1 ブロック 6 回・200ms 床
   if(minGap>0 || (live.draftCount||0)>=(fast?60:6)){pending=null;DIAG.draftsDropped++;return;}
   const wait=Math.max(0,Math.max(minGap,fast?0:200)-(Date.now()-lastSend));
@@ -1860,7 +1878,7 @@ $('diag').onclick = async ()=>{
   o.push('');
   o.push('診断: 認識='+(speechMode==='live'?'Geminiライブ':'ブラウザ内蔵')+' / 翻訳='+(fastOn()?'Cloud Translation':'Gemini')+
          ' / 確定 '+DIAG.commits+'（先行訳採用 '+DIAG.adopted+'・失敗 '+DIAG.failed+'）/ 先行訳 '+DIAG.drafts+'（見送り '+DIAG.draftsDropped+'）'+
-         ' / 429 '+DIAG.r429+' 回 / 内蔵認識へ退避 '+DIAG.fallback+' 回');
+         ' / 429 '+DIAG.r429+' 回 / 内蔵認識へ退避 '+DIAG.fallback+' 回'+(dayLimited?' / 1日の上限に到達':eco()?' / 節約モード中':''));
   for(const [k,v] of Object.entries(DIAG.errors)) o.push('  エラー '+v+' 回: '+k);
   if(rawLog.length){
     o.push('');o.push('直近のモデル応答（翻訳がおかしいときはここを貼ってください）');
@@ -1923,7 +1941,7 @@ if(new URLSearchParams(location.search).has('debug')) document.body.classList.ad
 // ?asr=browser で内蔵の音声認識（Chrome / iPhone）に、?asr=live で Gemini のライブ文字起こしに切り替える（この読み込みだけ。保存しない）。
 // 2026-09-28 実測: 発話→原文 980ms のうち大半がライブ文字起こしの遅れ。内蔵認識と同じ端末で比べるための入口
 { const a=new URLSearchParams(location.search).get('asr'); if(a==='browser'||a==='live') S.engine = a==='browser'?'browser':'auto'; }
-paint(); newLive();
+paint(); newLive(); paintGap();
 if(!window.isSecureContext){
   // http://<PCのIP>:8787 をスマホで開くとここに来る。マイク API 自体が無効になる
   stat.textContent='https が必要';
