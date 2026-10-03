@@ -1058,7 +1058,7 @@ async function sendFast(text, opts){
     apiOk(); return {out,detected,text,timings:opts.timings,batchOutputs:opts.batch?batchOutputs:null};
   } catch(e){
     if(e.name==='AbortError' && !opts.keep) return null;
-    if(e.status===429){ DIAG.r429++; last429=Date.now(); minGap=Math.min(60000,Math.max(1000,minGap*2)); paintGap(); }
+    if(e.status===429){ DIAG.r429++; last429=Date.now(); minGap=Math.min(15000,Math.max(1000,minGap*2)); paintGap(); }
     else if(e.status===403 || e.status===400 || e.status===404){
       // キーで Cloud Translation API が使えない（未有効化・課金無効・制限）。以後は Gemini に戻す
       fastState='no'; paint();
@@ -1100,7 +1100,8 @@ async function send(text, opts={}){
     if(res.status===429){
       last429=Date.now(); DIAG.r429++;
       const retry=Number(res.headers.get('retry-after'));
-      minGap=Math.min(60000,Math.max(1000,minGap*2,Number.isFinite(retry)?retry*1000:0));
+      // 上限は 15 秒。60 秒まで広げると、1回の 429 で1分近く訳が出なくなる
+      minGap=Math.min(15000,Math.max(1000,minGap*2,Number.isFinite(retry)?retry*1000:0));
       paintGap(); throw new Error('429 レート上限：送信間隔 '+minGap+'ms');
     }
     if(!res.ok){
@@ -1899,7 +1900,8 @@ function pushOverlay(){
   const el = hasTr(liveEl) ? liveEl : (lastTr || liveEl || done[done.length-1]);
   if(!el) return;
   const srcRow=el.querySelector('.l.src');
-  const p={live:el===liveEl, src:srcRow?srcRow.dataset.l:''};
+  // 翻訳が落ちている理由も字幕に出す（字幕だけ見ていると、Chrome 右下の警告に気づけない）
+  const p={live:el===liveEl, src:srcRow?srcRow.dataset.l:'', err:[$('api').textContent,$('gap').textContent].filter(Boolean).join('  ')};
   for(const k of ORDER){ const t=el.querySelector('.l[data-l="'+k+'"] .tx'); p[k]=t?t.textContent:''; }
   const body=JSON.stringify(p);
   if(body===ovLast) return;
@@ -1910,7 +1912,9 @@ if(/^(127\.0\.0\.1|localhost)$/.test(location.hostname)){
   fetch('/overlay').then(r=>r.ok?r.json():null).then(j=>{
     if(!j || !j.overlay) return;
     overlayOn=true;
-    new MutationObserver(pushOverlay).observe(stage,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['class']});
+    const mo=new MutationObserver(pushOverlay);
+    mo.observe(stage,{subtree:true,childList:true,characterData:true,attributes:true,attributeFilter:['class']});
+    mo.observe($('status'),{subtree:true,childList:true,characterData:true});
   }).catch(()=>{});
 }
 
