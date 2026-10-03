@@ -305,7 +305,26 @@ const save = () => { try { localStorage.setItem('rti2',JSON.stringify(S)); }
 
 const $ = id => document.getElementById(id);
 const stage=$('stage'), go=$('go'), dot=$('dot'), stat=$('stat'), errBox=$('err'), empty=$('empty');
-const SIL_MS=420;                 // 「間」とみなす無音の長さ。CoeFont も公開していない値なので固定で始める
+/* 無料枠が前提（2026-10-03 ユーザー決定）。先行訳（喋っている途中の訳）は1発話で最大 12 リクエスト使い、
+   無料枠の上限をすぐ超える。既定では確定訳だけを出す。課金キーで速さを取りたいときだけ URL に ?drafts=1 を付ける */
+const DRAFTS = new URLSearchParams(location.search).has('drafts');
+// 「間」とみなす無音の長さ。確定訳だけのときは少し長めにして発話をまとめる（リクエスト数が減り、訳の質も上がる）
+const SIL_MS = DRAFTS ? 420 : 650;
+// 無料枠の1分あたりの上限（15回前後）の手前で止める。直近60秒の送信数がこれに達したら、空くまで待ってまとめて送る
+const RPM_BUDGET = 12;
+function rpmWait(){
+  const now=Date.now();
+  while(sendLog.length && now-sendLog[0]>60000) sendLog.shift();
+  return sendLog.length<RPM_BUDGET ? 0 : 60000-(now-sendLog[0])+50;
+}
+// 今日の翻訳リクエスト数。1日の上限にどこで当たるかを知るために数える
+function countToday(){
+  try{
+    const d=new Date().toISOString().slice(0,10), o=JSON.parse(localStorage.getItem('rti2_day')||'{}');
+    const n=(o.d===d?o.n:0)+1; localStorage.setItem('rti2_day',JSON.stringify({d,n,cap:o.d===d?o.cap:undefined})); return n;
+  }catch(_){ return 0; }
+}
+function todayInfo(){ try{ const o=JSON.parse(localStorage.getItem('rti2_day')||'{}'); return o.d===new Date().toISOString().slice(0,10)?o:{n:0}; }catch(_){ return {n:0}; } }
 
 /* ===================== state ===================== */
 let rec=null, running=false, speechMode='browser', liveSpeech=null, liveRecoveries=0;
@@ -334,7 +353,7 @@ function paint(){
    「原文だけ並んで翻訳が出ない」が原因不明になる。直るまで出し続ける */
 function apiOk(){ $('api').textContent=''; }
 function apiBad(m){ $('api').textContent='\u26a0 '+m; }
-function paintGap(){ $('gap').textContent = dayLimited ? '1日の上限に到達' : eco() ? '節約モード（確定訳のみ）' : minGap ? 'gap '+minGap+'ms' : ''; }
+function paintGap(){ $('gap').textContent = dayLimited ? '1日の上限に到達' : (DRAFTS && eco()) ? '節約モード（確定訳のみ）' : minGap ? 'gap '+minGap+'ms' : ''; }
 
 function showErr(m){
   errBox.textContent=m; errBox.style.display='block';
@@ -1099,6 +1118,7 @@ async function send(text, opts={}){
   inflight++; lastSend=Date.now(); lastTouch=lastSend;
   sendLog.push(lastSend);
   while(sendLog.length && lastSend-sendLog[0]>60000) sendLog.shift();
+  countToday();
   let detected=null, out='', retryable=true;
   try {
     const res=await fetch(endpoint(),{
@@ -1114,11 +1134,11 @@ async function send(text, opts={}){
       let kind='';
       try{ const t=JSON.stringify(await res.json()); kind=/PerDay/i.test(t)?'day':/PerMinute/i.test(t)?'minute':''; }catch(_){}
       ecoOn();
-      if(kind==='day'){ dayLimited=true; retryable=false; }
+      if(kind==='day'){ dayLimited=true; retryable=false; try{ const o=todayInfo(); localStorage.setItem('rti2_day',JSON.stringify({d:new Date().toISOString().slice(0,10),n:o.n||0,cap:o.n||0})); }catch(_){} }
       paintGap();
-      throw new Error(kind==='day' ? '429 無料枠の1日の上限に達しました。今日は翻訳が通りません（課金を有効にしたキーが必要）'
-                    : kind==='minute' ? '429 1分あたりの上限。節約モードに切替（確定訳のみ）'
-                    : '429 レート上限。節約モードに切替（確定訳のみ）');
+      throw new Error(kind==='day' ? '429 無料枠の1日の上限に達しました。今日は翻訳が通りません'
+                    : kind==='minute' ? '429 1分あたりの上限。少し待って送り直します'
+                    : '429 レート上限。少し待って送り直します');
     }
     if(!res.ok){
       retryable=res.status>=500;
@@ -1188,7 +1208,7 @@ function pump(){
   // 途中翻訳は捨てても確定時に出るが、確定を落とすとその発話の訳は二度と出ない
   const fast=fastOn();
   // 節約モード中は先行訳を出さない（Cloud Translation 経路は回数の上限が別なので対象外）
-  if(!fast && eco()){ pending=null; DIAG.draftsDropped++; return; }
+  if(!fast && (!DRAFTS || eco())){ pending=null; DIAG.draftsDropped++; return; }
   // 最速経路は 1 往復が安く速いので、上限も床も置かない。Gemini は 1 ブロック 6 回・200ms 床
   if(minGap>0 || (live.draftCount||0)>=(fast?60:6)){pending=null;DIAG.draftsDropped++;return;}
   const wait=Math.max(0,Math.max(minGap,fast?0:200)-(Date.now()-lastSend));
@@ -1325,7 +1345,8 @@ async function drainFinalJobs(){
   finalWorker=true;
   try{
     while(finalJobs.length){
-      const wait=Math.max(0,minGap-(Date.now()-lastSend));if(wait)await sleep(wait);
+      // 429 の後の待ちと、1分あたりの予算の両方を見る。待っている間に溜まった発話は下でまとめて1リクエストになる
+      const wait=Math.max(0,minGap-(Date.now()-lastSend),fastOn()?0:rpmWait());if(wait)await sleep(wait);
       const jobs=[];let chars=0;
       while(finalJobs.length && jobs.length<12){
         const next=finalJobs[0];if(jobs.length && chars+next.t.length>1800)break;
@@ -1878,7 +1899,8 @@ $('diag').onclick = async ()=>{
   o.push('');
   o.push('診断: 認識='+(speechMode==='live'?'Geminiライブ':'ブラウザ内蔵')+' / 翻訳='+(fastOn()?'Cloud Translation':'Gemini')+
          ' / 確定 '+DIAG.commits+'（先行訳採用 '+DIAG.adopted+'・失敗 '+DIAG.failed+'）/ 先行訳 '+DIAG.drafts+'（見送り '+DIAG.draftsDropped+'）'+
-         ' / 429 '+DIAG.r429+' 回 / 内蔵認識へ退避 '+DIAG.fallback+' 回'+(dayLimited?' / 1日の上限に到達':eco()?' / 節約モード中':''));
+         ' / 429 '+DIAG.r429+' 回 / 内蔵認識へ退避 '+DIAG.fallback+' 回'+(dayLimited?' / 1日の上限に到達':'')+' / 先行訳 '+(DRAFTS?'オン':'オフ（無料枠向け）')+
+         ' / 今日の翻訳リクエスト '+(todayInfo().n||0)+' 回'+(todayInfo().cap?'（'+todayInfo().cap+' 回目で1日の上限）':'')+' / 直近1分 '+sendLog.length+' 回');
   for(const [k,v] of Object.entries(DIAG.errors)) o.push('  エラー '+v+' 回: '+k);
   if(rawLog.length){
     o.push('');o.push('直近のモデル応答（翻訳がおかしいときはここを貼ってください）');
