@@ -832,6 +832,8 @@ const sleep=ms=>new Promise(resolve=>BG.setTimeout(resolve,ms));
 const canonical=(text,lang)=>lang==='en'?text.trim().replace(/\s+/g,' '):text.replace(/\s+/g,'');
 const cacheKey=(text,lang)=>lang+'\n'+canonical(text,lang);
 const perfLog=[];
+// 何が起きているかを数える。接続テストに出す（「訳が出ない」が 429 なのか丸写しなのか認識なのかを切り分ける）
+const DIAG={commits:0,adopted:0,failed:0,drafts:0,draftsDropped:0,r429:0,fallback:0,langSwitch:0,errors:{}};
 const rawLog=[];   // 直近の生応答。翻訳がおかしいとき、接続テストで確認する
 /* ブロックが最初の原文を受け取った時刻と、その直前の声の立ち上がりを記録する。
    「発話 → 原文」「原文 → 訳」「発話 → 訳」をここから出す。しきい値ベースなので目安だが、
@@ -873,6 +875,14 @@ function trackPerformance(blk,started,reused){
 }
 function paintQueue(){}                                    // 待ち件数は出さない（右下は状態と1つの数字だけ）
 
+// 同じ文字列でも「訳しても同じ形になる」発話は丸写しではない（固有名詞・略語・数字だけ、など）。
+// 丸写しと断定するのは、原文に「その訳語側の言語には現れないはずの文字や語の並び」があるときだけ
+function looksUntranslated(src, from, to){
+  if(from==='ja') return /[ぁ-ゖァ-ヺ]/.test(src);                       // かなは英・中の訳に残らない
+  if(from==='zh') return to==='en' ? /[一-鿿]/.test(src) : flat(src).length>=10;   // 漢字だけの短い語は日中で同形がある
+  // 英語: 普通の単語（小文字始まり）が3語以上並んでいれば文。固有名詞や略語だけの発話は同形でよい
+  return (src.match(/\b[a-z][a-z']+\b/g)||[]).length>=3;
+}
 const flat=t=>(t||'').replace(/[\s\p{P}]+/gu,'').toLowerCase();   // 空白と句読点を無視して比べる
 function completeOutput(out,lang,src,only){
   const lines={}; parseInto(out,(k,v)=>lines[k]=v.trim());
@@ -884,7 +894,7 @@ function completeOutput(out,lang,src,only){
   // 「OK」「2024」のような短い語は訳しても同じ形になり得るので、ある程度の長さがあるときだけ見る
   if(src && flat(src).length>=6){
     const f=flat(src);
-    for(const k of need) if(flat(lines[k])===f) return false;
+    for(const k of need) if(flat(lines[k])===f && looksUntranslated(src,lang,k)) return false;
   }
   return true;
 }
@@ -1048,7 +1058,7 @@ async function sendFast(text, opts){
     apiOk(); return {out,detected,text,timings:opts.timings,batchOutputs:opts.batch?batchOutputs:null};
   } catch(e){
     if(e.name==='AbortError' && !opts.keep) return null;
-    if(e.status===429){ last429=Date.now(); minGap=Math.min(60000,Math.max(1000,minGap*2)); paintGap(); }
+    if(e.status===429){ DIAG.r429++; last429=Date.now(); minGap=Math.min(60000,Math.max(1000,minGap*2)); paintGap(); }
     else if(e.status===403 || e.status===400 || e.status===404){
       // キーで Cloud Translation API が使えない（未有効化・課金無効・制限）。以後は Gemini に戻す
       fastState='no'; paint();
@@ -1058,6 +1068,7 @@ async function sendFast(text, opts){
     }
     retryable=!(e.status>=400 && e.status<500);
     const message=e.name==='AbortError'?'翻訳がタイムアウトしました':e.message;
+    DIAG.errors[message.slice(0,40)]=(DIAG.errors[message.slice(0,40)]||0)+1;
     showErr(message); apiBad(message.slice(0,65));
     return {error:true,retryable};
   } finally {
@@ -1087,7 +1098,7 @@ async function send(text, opts={}){
       body:JSON.stringify(opts.batch?buildBatchBody(opts.batch):buildBody(text,false,sourceLang,opts)),cache:'no-store',signal:controller.signal
     });
     if(res.status===429){
-      last429=Date.now();
+      last429=Date.now(); DIAG.r429++;
       const retry=Number(res.headers.get('retry-after'));
       minGap=Math.min(60000,Math.max(1000,minGap*2,Number.isFinite(retry)?retry*1000:0));
       paintGap(); throw new Error('429 レート上限：送信間隔 '+minGap+'ms');
@@ -1143,6 +1154,7 @@ async function send(text, opts={}){
   } catch(e){
     if(e.name==='AbortError' && !opts.keep) return null;
     const message=e.name==='AbortError'?'翻訳がタイムアウトしました':e.message;
+    DIAG.errors[message.slice(0,40)]=(DIAG.errors[message.slice(0,40)]||0)+1;
     showErr(message); apiBad(message.slice(0,65));
     return {error:true,retryable};
   } finally {
@@ -1159,7 +1171,7 @@ function pump(){
   // 途中翻訳は捨てても確定時に出るが、確定を落とすとその発話の訳は二度と出ない
   const fast=fastOn();
   // 最速経路は 1 往復が安く速いので、上限も床も置かない。Gemini は 1 ブロック 6 回・200ms 床
-  if(minGap>0 || (live.draftCount||0)>=(fast?60:6)){pending=null;return;}
+  if(minGap>0 || (live.draftCount||0)>=(fast?60:6)){pending=null;DIAG.draftsDropped++;return;}
   const wait=Math.max(0,Math.max(minGap,fast?0:200)-(Date.now()-lastSend));
   if(wait>0){ BG.clearTimeout(gapTimer); gapTimer=BG.setTimeout(pump, wait); return; }
   const t=pending; pending=null;
@@ -1171,13 +1183,15 @@ function pump(){
   const lang=curLang, block=live, epoch=generation;
   // B: Gemini 経路の先行訳はターゲット別に並列2本で投げる。1本だと2言語目は1言語目の出力が終わるまで待つ。
   //    seq と AbortController を共有し、確定時にはまとめて採用／中止する。Cloud Translation 経路は元々ターゲット別並列
-  const targets=ORDER.filter(l=>l!==lang), split = !fastOn() && targets.length>=2;
+  // 並列2本はリクエスト数が倍になる。このセッションで一度でも 429 を受けたら1本に戻す
+  const targets=ORDER.filter(l=>l!==lang), split = !fastOn() && targets.length>=2 && !last429;
   const ctrl=new AbortController(), mySeq=++seq;
-  const mk=(only)=>({sourceLang:lang,block,noCtx:true,controller:ctrl,seq:mySeq,only});
+  // 先行訳にも文脈（直近2往復）を付ける。先行訳は確定にそのまま採用されるので、文脈なしだと確定訳の質が落ちる
+  const mk=(only)=>({sourceLang:lang,block,controller:ctrl,seq:mySeq,only});
   const optsList = split ? [mk([targets[0]]), mk(targets.slice(1))] : [mk(null)];
   const opts=optsList[0];
   const preview={key:cacheKey(t,lang),text:t,opts,optsList,promise:null};
-  block.preview=preview;block.draftCount=(block.draftCount||0)+1;
+  block.preview=preview;block.draftCount=(block.draftCount||0)+1;DIAG.drafts++;
   preview.promise=Promise.all(optsList.map(o=>send(t,o))).then(rs=>{
     let r=null;
     if(rs.some(x=>x===null)) r=null;
@@ -1328,7 +1342,9 @@ function commit(srcText){
   const adopt=preview && !preview.opts.controller?.signal.aborted &&
     (preview.key===cacheKey(t,lang) || (preview.text!=null && loose(preview.text)===loose(t)));
   pending=null; lastText=''; BG.clearTimeout(gapTimer); seq++;
+  DIAG.commits++;
   if(adopt){
+    DIAG.adopted++;
     preview.opts.keep=true; (preview.optsList||[]).forEach(o=>o.keep=true);
     if(draftController===preview.opts.controller) draftController=null;
   } else if(draftController) draftController.abort();
@@ -1361,6 +1377,7 @@ function commit(srcText){
   return commitChain;
 }
 function markFailed(blk){
+  DIAG.failed++;
   for(const k of ORDER) if(k!==blk.sourceLang){
     blk.tx[k].textContent='翻訳できませんでした';blk.tx[k].classList.add('miss');
   }
@@ -1633,8 +1650,9 @@ class LiveTranscriber {
             if(this.n===800){
               let peak=0;for(let k=0;k<800;k++){const a=Math.abs(this.f[k]);if(a>peak)peak=a;}
               // 囁き対策の簡易AGC: 小さい声は最大8倍まで持ち上げる。無音（ノイズ床）は持ち上げない
-              const want=peak<0.004?1:Math.min(8,Math.max(1,0.5/peak));
-              this.gain=this.gain*0.7+want*0.3;
+              // 最大 4 倍・ゆっくり追従。50ms ごとに倍率が大きく動くと音量が波打ち、認識精度を落とす
+              const want=peak<0.004?1:Math.min(4,Math.max(1,0.4/peak));
+              this.gain=this.gain*0.9+want*0.1;
               const out=new Int16Array(800);
               for(let k=0;k<800;k++){const v=Math.max(-1,Math.min(1,this.f[k]*this.gain));out[k]=v<0?v*32768:v*32767;}
               this.port.postMessage(out.buffer,[out.buffer]);this.n=0;}}
@@ -1696,6 +1714,7 @@ async function recoverLiveSpeech(epoch){
   fallbackSpeech(epoch);
 }
 function fallbackSpeech(epoch){
+  DIAG.fallback++;
   if(epoch!==generation || !running)return;
   const remaining=lastInterim.trim();if(remaining)commit(remaining);resetSeg();
   liveSpeech?.close();liveSpeech=null;speechMode='browser';
@@ -1837,6 +1856,11 @@ $('diag').onclick = async ()=>{
       result.batchOutputs.forEach((output,i)=>o.push('  '+L[jobs[i].lang].tag+'：'+output.replace(/\n/g,' / ')));
     }else o.push('Gemini API           : 失敗（右下のエラーを確認してください）');
   }
+  o.push('');
+  o.push('診断: 認識='+(speechMode==='live'?'Geminiライブ':'ブラウザ内蔵')+' / 翻訳='+(fastOn()?'Cloud Translation':'Gemini')+
+         ' / 確定 '+DIAG.commits+'（先行訳採用 '+DIAG.adopted+'・失敗 '+DIAG.failed+'）/ 先行訳 '+DIAG.drafts+'（見送り '+DIAG.draftsDropped+'）'+
+         ' / 429 '+DIAG.r429+' 回 / 内蔵認識へ退避 '+DIAG.fallback+' 回');
+  for(const [k,v] of Object.entries(DIAG.errors)) o.push('  エラー '+v+' 回: '+k);
   if(rawLog.length){
     o.push('');o.push('直近のモデル応答（翻訳がおかしいときはここを貼ってください）');
     for(const r of rawLog) o.push('  ['+r.at+' '+r.lang+'] '+r.text.slice(0,40)+'\n      → '+r.out.replace(/\n/g,' / ').slice(0,160));
@@ -1866,12 +1890,16 @@ document.addEventListener('keydown', e=>{
 let overlayOn=false, ovLast='';
 function pushOverlay(){
   if(!overlayOn) return;
+  // 訳が付いているブロックを優先する。喋り続けていると、前の発話の確定訳が届く前に次の発話が始まり、
+  // 「いま喋っている原文だけ（訳は空）」に切り替わって、訳が一度も字幕に出ないまま流れていた（2026-10-03）
+  const hasTr=e=>!!e && [...e.querySelectorAll('.l:not(.src) .tx')].some(t=>t.textContent.trim() && !t.classList.contains('miss'));
   const liveEl=document.querySelector('#stage .u.live.has-text');
-  const done=document.querySelectorAll('#stage .u:not(.live)');
-  const el=liveEl || done[done.length-1];
+  const done=[...document.querySelectorAll('#stage .u:not(.live)')];
+  const lastTr=[...done].reverse().find(hasTr);
+  const el = hasTr(liveEl) ? liveEl : (lastTr || liveEl || done[done.length-1]);
   if(!el) return;
   const srcRow=el.querySelector('.l.src');
-  const p={live:!!liveEl, src:srcRow?srcRow.dataset.l:''};
+  const p={live:el===liveEl, src:srcRow?srcRow.dataset.l:''};
   for(const k of ORDER){ const t=el.querySelector('.l[data-l="'+k+'"] .tx'); p[k]=t?t.textContent:''; }
   const body=JSON.stringify(p);
   if(body===ovLast) return;
