@@ -312,10 +312,24 @@ const DRAFTS = new URLSearchParams(location.search).has('drafts');
 const SIL_MS = DRAFTS ? 420 : 650;
 // 無料枠の1分あたりの上限（15回前後）の手前で止める。直近60秒の送信数がこれに達したら、空くまで待ってまとめて送る
 const RPM_BUDGET = 12;
+// 実際の上限はモデルや時期で変わり、12 でも当たることがある（2026-10-04 実機）。429 を受けたら、その時点の
+// 直近60秒の送信数から「ここまでなら通る」を学習して下げ、端末に覚えておく。10 分当たらなければ1つずつ戻す
+let rpmBudget=RPM_BUDGET, budgetAt=0;
+try{ const o=JSON.parse(localStorage.getItem('rti2_rpm')||'{}'); if(o.b>=3 && o.b<=RPM_BUDGET){ rpmBudget=o.b; budgetAt=o.t||0; } }catch(_){}
+function saveBudget(){ try{ localStorage.setItem('rti2_rpm',JSON.stringify({b:rpmBudget,t:budgetAt})); }catch(_){} }
+function budgetNow(){
+  if(rpmBudget<RPM_BUDGET && Date.now()-budgetAt>600000){ rpmBudget++; budgetAt=Date.now(); saveBudget(); }
+  return rpmBudget;
+}
+function learnBudget(){
+  const now=Date.now();
+  while(sendLog.length && now-sendLog[0]>60000) sendLog.shift();
+  rpmBudget=Math.max(3, Math.min(rpmBudget, sendLog.length-1)); budgetAt=now; saveBudget();
+}
 function rpmWait(){
   const now=Date.now();
   while(sendLog.length && now-sendLog[0]>60000) sendLog.shift();
-  return sendLog.length<RPM_BUDGET ? 0 : 60000-(now-sendLog[0])+50;
+  return sendLog.length<budgetNow() ? 0 : 60000-(now-sendLog[0])+50;
 }
 // 今日の翻訳リクエスト数。1日の上限にどこで当たるかを知るために数える
 function countToday(){
@@ -353,7 +367,7 @@ function paint(){
    「原文だけ並んで翻訳が出ない」が原因不明になる。直るまで出し続ける */
 function apiOk(){ $('api').textContent=''; }
 function apiBad(m){ $('api').textContent='\u26a0 '+m; }
-function paintGap(){ $('gap').textContent = dayLimited ? '1日の上限に到達' : (DRAFTS && eco()) ? '節約モード（確定訳のみ）' : minGap ? 'gap '+minGap+'ms' : ''; }
+function paintGap(){ $('gap').textContent = dayLimited ? '1日の上限に到達' : (DRAFTS && eco()) ? '節約モード（確定訳のみ）' : minGap ? '利用上限のため '+Math.ceil(minGap/1000)+' 秒待機中' : ''; }
 
 function showErr(m){
   errBox.textContent=m; errBox.style.display='block';
@@ -1078,7 +1092,7 @@ async function sendFast(text, opts){
     scroll();
     const batchOutputs=outs.map(linesOf), out=batchOutputs[0];
     if(!opts.batch && !completeOutput(out,sourceLang,text,opts.only)) throw new Error('翻訳が不完全です（訳が無い、または原文のまま）');
-    if(minGap && Date.now()-last429>60000){ minGap=Math.max(0,minGap-100); paintGap(); }
+    if(minGap){ minGap=0; paintGap(); }   // 待ったあとに通った＝上限は解けた。以後は1分あたりの予算で抑える
     opts.timings.complete=performance.now();
     rawLog.push({at:new Date().toISOString().slice(11,19),lang:sourceLang,text:opts.batch?'(batch)':text,out}); if(rawLog.length>6) rawLog.shift();
     if(fastState!=='ok'){ fastState='ok'; paint(); }
@@ -1134,6 +1148,7 @@ async function send(text, opts={}){
       let kind='';
       try{ const t=JSON.stringify(await res.json()); kind=/PerDay/i.test(t)?'day':/PerMinute/i.test(t)?'minute':''; }catch(_){}
       ecoOn();
+      if(kind!=='day') learnBudget();
       if(kind==='day'){ dayLimited=true; retryable=false; try{ const o=todayInfo(); localStorage.setItem('rti2_day',JSON.stringify({d:new Date().toISOString().slice(0,10),n:o.n||0,cap:o.n||0})); }catch(_){} }
       paintGap();
       throw new Error(kind==='day' ? '429 無料枠の1日の上限に達しました。今日は翻訳が通りません'
@@ -1184,7 +1199,7 @@ async function send(text, opts={}){
       }
     } finally { await reader.cancel().catch(()=>{}); }
     if(!opts.batch && !completeOutput(out,sourceLang,text,opts.only)) throw new Error('翻訳が不完全です（訳が無い、または原文のまま）');
-    if(minGap && Date.now()-last429>60000){ minGap=Math.max(0,minGap-100); paintGap(); }
+    if(minGap){ minGap=0; paintGap(); }   // 待ったあとに通った＝上限は解けた。以後は1分あたりの予算で抑える
     opts.timings.complete=performance.now();
     rawLog.push({at:new Date().toISOString().slice(11,19),lang:sourceLang,text:opts.batch?'(batch)':text,out}); if(rawLog.length>6) rawLog.shift();
     apiOk(); return {out,detected,text,timings:opts.timings,batchOutputs:opts.batch?splitBatchOutput(out,opts.batch.length):null};
@@ -1900,7 +1915,7 @@ $('diag').onclick = async ()=>{
   o.push('診断: 認識='+(speechMode==='live'?'Geminiライブ':'ブラウザ内蔵')+' / 翻訳='+(fastOn()?'Cloud Translation':'Gemini')+
          ' / 確定 '+DIAG.commits+'（先行訳採用 '+DIAG.adopted+'・失敗 '+DIAG.failed+'）/ 先行訳 '+DIAG.drafts+'（見送り '+DIAG.draftsDropped+'）'+
          ' / 429 '+DIAG.r429+' 回 / 内蔵認識へ退避 '+DIAG.fallback+' 回'+(dayLimited?' / 1日の上限に到達':'')+' / 先行訳 '+(DRAFTS?'オン':'オフ（無料枠向け）')+
-         ' / 今日の翻訳リクエスト '+(todayInfo().n||0)+' 回'+(todayInfo().cap?'（'+todayInfo().cap+' 回目で1日の上限）':'')+' / 直近1分 '+sendLog.length+' 回');
+         ' / 今日の翻訳リクエスト '+(todayInfo().n||0)+' 回'+(todayInfo().cap?'（'+todayInfo().cap+' 回目で1日の上限）':'')+' / 直近1分 '+sendLog.length+' 回（1分あたりの予算 '+rpmBudget+' 回）');
   for(const [k,v] of Object.entries(DIAG.errors)) o.push('  エラー '+v+' 回: '+k);
   if(rawLog.length){
     o.push('');o.push('直近のモデル応答（翻訳がおかしいときはここを貼ってください）');
